@@ -104,8 +104,19 @@ def secondary_structure_score(target):
 def passes_filters(gc, hp1, hp2, dim, struct):
     return (35 <= gc <= 65) and hp1 <= 6 and hp2 <= 6 and dim <= 6 and struct <= 4
 
+def qc_flags(gc, hp1, hp2, dim, struct):
+    """Return list of failed filter names, empty list if all pass."""
+    flags = []
+    if not (35 <= gc <= 65): flags.append(f"GC {gc:.1f}%")
+    if hp1 > 6:              flags.append(f"Hairpin-P1 {hp1}")
+    if hp2 > 6:              flags.append(f"Hairpin-P2 {hp2}")
+    if dim > 6:              flags.append(f"Dimer {dim}")
+    if struct > 4:           flags.append(f"Structure {struct}")
+    return flags
+
 # ── Core probe builder (single target) ────────────────────────────────────────
-def build_probe_row(probe_num, target, arm_type, start=0, label=None):
+def build_probe_row(probe_num, target, arm_type, start=0, label=None, force=False):
+    """Build a probe row. If force=True, always return a row even if QC fails."""
     ini = INITIATORS[arm_type]
     P1, P2, S1, S2 = ini["P1"], ini["P2"], ini["S1"], ini["S2"]
     arm1   = target[:25]
@@ -119,10 +130,13 @@ def build_probe_row(probe_num, target, arm_type, start=0, label=None):
     struct = secondary_structure_score(target)
     tm1    = tm_basic(probe1)
     tm2    = tm_basic(probe2)
-    if not passes_filters(gc, hp1, hp2, dim, struct):
+    flags  = qc_flags(gc, hp1, hp2, dim, struct)
+    if not force and flags:
         return None
     row = {
         "Probe_#":         probe_num,
+        "QC_status":       "PASS" if not flags else "FLAG",
+        "QC_flags":        "; ".join(flags) if flags else "",
         "Target_start":    start + 1,
         "Target_end":      start + 52,
         "Target_sequence": target,
@@ -251,25 +265,23 @@ def find_common_regions(records: dict, k: int = 52) -> list:
     return deduped
 
 def common_regions_to_probe_df(common_regions, arm_type, seq_names):
-    """Convert common region list to probe DataFrame, applying QC filters."""
-    rows, failed = [], []
+    """Convert common region list to probe DataFrame.
+    ALL regions get a probe row. QC failures are flagged in QC_status/QC_flags columns."""
+    rows = []
     for idx, region in enumerate(common_regions):
-        kmer  = region["kmer"]
-        label = f"Common_region_{idx+1:02d}"
-        # Position note: pos in each sequence
+        kmer    = region["kmer"]
+        label   = f"Common_region_{idx+1:02d}"
         pos_str = " | ".join(f"{n}:{p}" for n, p in region["positions"].items())
-        row = build_probe_row(idx + 1, kmer, arm_type, start=0, label=label)
-        if row:
-            row["GC_all_seqs"]    = region["gc"]
-            row["Positions"]      = pos_str
-            row["Same_position"]  = "Yes" if len(set(region["positions"].values())) == 1 else "No"
-            rows.append(row)
-        else:
-            failed.append(label)
+        row = build_probe_row(idx + 1, kmer, arm_type, start=0, label=label, force=True)
+        row["Positions"]     = pos_str
+        row["Same_position"] = "Yes" if len(set(region["positions"].values())) == 1 else "No"
+        rows.append(row)
     df = pd.DataFrame(rows)
     if not df.empty:
         df["Probe_#"] = range(1, len(df) + 1)
-    return df, failed
+    n_pass  = (df["QC_status"] == "PASS").sum() if not df.empty else 0
+    n_flag  = (df["QC_status"] == "FLAG").sum() if not df.empty else 0
+    return df, n_pass, n_flag
 
 # ── Excel helpers ──────────────────────────────────────────────────────────────
 def _thin_border():
@@ -386,7 +398,7 @@ def write_common_regions_sheet(ws, common_regions, seq_names):
 def write_design_sheet(ws, df, gene_name, arm_type, has_label_col=False, extra_cols=None):
     ini = INITIATORS[arm_type]
     n_extra = len(extra_cols) if extra_cols else 0
-    total_cols = 18 + (1 if has_label_col else 0) + n_extra
+    total_cols = 20 + (1 if has_label_col else 0) + n_extra
     last_col = get_column_letter(total_cols)
     ws.merge_cells(f"A1:{last_col}1")
     ws["A1"] = f"HCR Probe Design Report  ·  {gene_name}  ·  Initiator: {arm_type}"
@@ -399,19 +411,24 @@ def write_design_sheet(ws, df, gene_name, arm_type, has_label_col=False, extra_c
     ws["A2"].font = Font(name="Arial", size=10, italic=True, color=C_DARK)
     ws["A2"].fill = _fill(C_TEAL_LITE)
     ws["A2"].alignment = _left()
+    n_pass_disp = (df["QC_status"] == "PASS").sum() if "QC_status" in df.columns else len(df)
+    n_flag_disp = (df["QC_status"] == "FLAG").sum() if "QC_status" in df.columns else 0
     ws.merge_cells(f"A4:{last_col}4")
-    ws["A4"] = f"✔  PASSING PROBES  ({len(df)} probes ready for ordering)"
+    ws["A4"] = (f"ALL PROBES: {len(df)} total  ·  ✔ {n_pass_disp} PASS (green)  ·  "
+                f"⚠ {n_flag_disp} FLAGGED (red) — see QC Flags column")
     ws["A4"].font = Font(name="Arial", size=11, bold=True, color=C_WHITE)
-    ws["A4"].fill = _fill(C_GREEN)
+    ws["A4"].fill = _fill(C_TEAL)
     ws["A4"].alignment = _left()
     ws.row_dimensions[4].height = 22
 
-    HEADERS    = ["#","Start","End","Target Sequence (52 nt)","Arm1 (25 nt)","Arm2 (25 nt)",
+    HEADERS    = ["#","QC Status","QC Flags (failed filters)",
+                  "Start","End","Target Sequence (52 nt)","Arm1 (25 nt)","Arm2 (25 nt)",
                   "Probe 1 (5'→3')","Probe 2 (5'→3')","P1 Len","P2 Len",
                   "GC %","Tm P1 (°C)","Tm P2 (°C)","Hairpin P1","Hairpin P2",
                   "Dimer","Structure","Initiator"]
-    COL_WIDTHS = [5,7,7,34,16,16,42,42,7,7,8,10,10,10,10,8,10,10]
-    KEYS       = ["Probe_#","Target_start","Target_end","Target_sequence",
+    COL_WIDTHS = [5,10,32,7,7,34,16,16,42,42,7,7,8,10,10,10,10,8,10,10]
+    KEYS       = ["Probe_#","QC_status","QC_flags",
+                  "Target_start","Target_end","Target_sequence",
                   "Arm1_5to3","Arm2_5to3","Probe1_5to3","Probe2_5to3",
                   "Probe1_length","Probe2_length","GC_percent","Tm_P1_C","Tm_P2_C",
                   "Hairpin_P1","Hairpin_P2","Dimer_score","Structure_score","Initiator_set"]
@@ -436,7 +453,9 @@ def write_design_sheet(ws, df, gene_name, arm_type, has_label_col=False, extra_c
 
     label_offset = 1 if has_label_col else 0
     for r_off, (_, rec) in enumerate(df.iterrows()):
-        row = 6 + r_off
+        row     = 6 + r_off
+        is_flag = rec.get("QC_status", "PASS") == "FLAG"
+        row_bg  = C_RED_LT if is_flag else C_GREEN_LT
         for ci, key in enumerate(KEYS, start=1):
             cell = ws.cell(row=row, column=ci)
             val  = rec.get(key, "")
@@ -444,10 +463,24 @@ def write_design_sheet(ws, df, gene_name, arm_type, has_label_col=False, extra_c
                 cell.value = _rich_probe(val, ini["P1"], ini["S1"], spacer_after=False)
             elif key == "Probe2_5to3":
                 cell.value = _rich_probe(val, ini["P2"], ini["S2"], spacer_after=True)
+            elif key == "QC_status":
+                cell.value = val
+                cell.font  = Font(name="Arial", size=10, bold=True,
+                                  color=C_WHITE)
+                cell.fill  = _fill(C_RED if is_flag else C_GREEN)
+                cell.border    = _thin_border()
+                cell.alignment = _center()
+                continue
+            elif key == "QC_flags":
+                cell.value = val
+                cell.font  = Font(name="Arial", size=10, bold=is_flag, color=C_RED if is_flag else C_DARK)
+                cell.fill  = _fill(row_bg); cell.border = _thin_border()
+                cell.alignment = _left()
+                continue
             else:
                 cell.value = val
                 cell.font  = _cfont(bold=(key in ("Probe_#", "Target_label")))
-            cell.fill = _fill(C_GREEN_LT); cell.border = _thin_border()
+            cell.fill = _fill(row_bg); cell.border = _thin_border()
             cell.alignment = _left() if ci > (3 + label_offset) else _center()
     ws.freeze_panes = ws["A6"]
 
@@ -729,40 +762,54 @@ with tab3:
 
                     st.divider()
 
-                    # ── Step 2: design probes on passing common regions ────────
-                    with st.spinner("Designing HCR probes on passing common regions…"):
-                        df, failed = common_regions_to_probe_df(
+                    # ── Step 2: design probes for ALL common regions, flag QC issues ──
+                    with st.spinner("Designing HCR probes for all common regions…"):
+                        df, n_pass, n_flag = common_regions_to_probe_df(
                             common_regions, arm_type, seq_names
                         )
 
-                    if failed:
-                        st.warning(f"⚠️ {len(failed)} region(s) failed QC filters: " + ", ".join(failed))
-
                     if df.empty:
-                        st.error("No probes passed QC. Try a different initiator set.")
+                        st.error("Could not design probes. Try a different initiator set.")
                     else:
                         st.subheader(f"Step 2 — Probes Designed: {len(df)}")
-                        st.success(f"✅ {len(df)} probes — {len(df)*2} oligos ready to order")
 
                         c1, c2, c3, c4 = st.columns(4)
-                        c1.metric("Sequences",         len(records))
-                        c2.metric("Common regions",    len(common_regions))
-                        c3.metric("Probes passed QC",  len(df))
-                        c4.metric("Oligos",            len(df)*2)
+                        c1.metric("Sequences",      len(records))
+                        c2.metric("Common regions", len(common_regions))
+                        c3.metric("✔ PASS",         n_pass)
+                        c4.metric("⚠ FLAGGED",      n_flag)
 
-                        preview_cols = ["Probe_#","Target_label","Target_sequence",
-                                        "GC_percent","Tm_P1_C","Tm_P2_C",
+                        if n_pass > 0:
+                            st.success(f"✅ {n_pass} probe(s) passed all QC filters — {n_pass*2} oligos are ideal for ordering")
+                        if n_flag > 0:
+                            st.warning(
+                                f"⚠️ **{n_flag} probe(s) are flagged** (highlighted red below). "
+                                f"Probes were still fully designed but one or more QC filters failed. "
+                                f"Check the **QC Flags** column for the specific filter(s) triggered. "
+                                f"Use these probes with caution."
+                            )
+
+                        preview_cols = ["Probe_#","QC_status","QC_flags","Target_label",
+                                        "Target_sequence","GC_percent","Tm_P1_C","Tm_P2_C",
                                         "Hairpin_P1","Hairpin_P2","Dimer_score",
                                         "Structure_score","Same_position","Positions"]
-                        st.dataframe(df[[c for c in preview_cols if c in df.columns]],
-                                     use_container_width=True, hide_index=True)
+                        preview_df = df[[c for c in preview_cols if c in df.columns]].copy()
+
+                        def highlight_flags(row):
+                            color = "background-color: #FADBD8" if row.get("QC_status") == "FLAG" else "background-color: #D5F5E3"
+                            return [color] * len(row)
+
+                        st.dataframe(
+                            preview_df.style.apply(highlight_flags, axis=1),
+                            use_container_width=True, hide_index=True
+                        )
 
                         extra = [
-                            ("Sequences in file",   len(records)),
-                            ("Sequence names",       ", ".join(seq_names)),
-                            ("Common regions found", len(common_regions)),
-                            ("Regions passed QC",    len(df)),
-                            ("Regions failed QC",    len(failed)),
+                            ("Sequences in file",         len(records)),
+                            ("Sequence names",             ", ".join(seq_names)),
+                            ("Common regions found",       len(common_regions)),
+                            ("Probes PASS (all QC)",       n_pass),
+                            ("Probes FLAGGED (review QC)", n_flag),
                         ]
                         extra_cols = [
                             ("Same_position", "Same Position?", 16),
@@ -770,7 +817,7 @@ with tab3:
                         ]
                         excel_bytes = build_excel(
                             df, multi_label, arm_type,
-                            "Multi-FASTA — common 52 bp regions", extra,
+                            "Multi-FASTA — all common regions (QC flags shown)", extra,
                             has_label_col=True,
                             extra_cols=extra_cols,
                             common_regions=common_regions,
