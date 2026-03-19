@@ -1,8 +1,9 @@
 """
 HCR Split-Initiator Probe Designer — Streamlit App
-Supports two input modes:
-  1. FASTA sequence  → auto-tiles, filters, ranks and designs probes
+Three input modes:
+  1. Single FASTA  → auto-tiles, filters, ranks and designs probes
   2. Direct 52 bp target regions → designs probes straight from your targets
+  3. Multi-FASTA   → finds common 52 bp regions across all sequences, then designs probes
 """
 
 import io
@@ -18,7 +19,10 @@ from openpyxl.utils import get_column_letter
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="HCR Probe Designer", page_icon="🧬", layout="wide")
 st.title("🧬 HCR Split-Initiator Probe Designer")
-st.markdown("Design HCR probes from a full FASTA sequence **or** paste pre-selected 52 bp target regions directly.")
+st.markdown(
+    "Three modes: design probes from a **single FASTA**, paste **direct 52 bp targets**, "
+    "or upload a **multi-FASTA** to find common regions across all sequences first."
+)
 
 # ── HCR initiator sequences ────────────────────────────────────────────────────
 INITIATORS = {
@@ -34,10 +38,14 @@ C_TEAL      = "1A7A8A"
 C_TEAL_LITE = "D0EDF1"
 C_GREEN     = "1E8449"
 C_GREEN_LT  = "D5F5E3"
+C_PURPLE    = "6C3483"
+C_PURPLE_LT = "E8DAEF"
 C_GREY      = "F2F4F4"
 C_WHITE     = "FFFFFF"
 C_DARK      = "1C2833"
 C_SPACER    = "E74C3C"
+C_RED       = "C0392B"
+C_RED_LT    = "FADBD8"
 
 # ── Sequence utilities ─────────────────────────────────────────────────────────
 _COMP = str.maketrans("ATGCatgc", "TACGtacg")
@@ -137,7 +145,7 @@ def build_probe_row(probe_num, target, arm_type, start=0, label=None):
         row["Target_label"] = label
     return row
 
-# ── Mode 1: FASTA ──────────────────────────────────────────────────────────────
+# ── Mode 1: single FASTA ───────────────────────────────────────────────────────
 def generate_probes_from_fasta(seq, arm_type, step=52, target_len=52):
     rows = []
     for i in range(0, len(seq) - target_len + 1, step):
@@ -161,15 +169,8 @@ def rank_and_select(df, max_probes=30):
     df["Probe_#"] = range(1, len(df) + 1)
     return df.drop(columns=["_score"])
 
-# ── Mode 2: Direct 52 bp targets ──────────────────────────────────────────────
+# ── Mode 2: direct 52 bp targets ──────────────────────────────────────────────
 def parse_target_input(raw):
-    """
-    Accepts:
-      - >label / SEQUENCE (FASTA-style)
-      - Plain sequences one per line
-      - Numbered: 1. SEQ  or  1) SEQ
-    Returns list of (label, sequence).
-    """
     targets = []
     lines = [l.strip() for l in raw.strip().splitlines() if l.strip()]
     i = 0
@@ -194,6 +195,74 @@ def generate_probes_from_targets(targets, arm_type):
     for idx, (label, target) in enumerate(targets):
         row = build_probe_row(idx + 1, target, arm_type, start=0, label=label)
         if row:
+            rows.append(row)
+        else:
+            failed.append(label)
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["Probe_#"] = range(1, len(df) + 1)
+    return df, failed
+
+# ── Mode 3: multi-FASTA → common 52 bp regions → probes ───────────────────────
+def find_common_regions(records: dict, k: int = 52) -> list:
+    """
+    Find all k-mers common to every sequence in records.
+    Returns list of dicts with kmer, gc, positions per sequence,
+    deduplicated to non-overlapping windows (step >= k).
+    """
+    names = list(records.keys())
+    seqs  = list(records.values())
+
+    # Build kmer sets
+    kmer_sets = []
+    for seq in seqs:
+        kmer_sets.append(set(seq[i:i+k] for i in range(len(seq) - k + 1)))
+
+    # Intersection across all sequences
+    common = kmer_sets[0]
+    for ks in kmer_sets[1:]:
+        common &= ks
+
+    if not common:
+        return []
+
+    # For each common kmer, record first position in each sequence and GC
+    results = []
+    for kmer in common:
+        positions = {name: seq.index(kmer) + 1 for name, seq in zip(names, seqs)}
+        gc = round(gc_content(kmer), 1)
+        # Sort by position in first sequence
+        results.append({
+            "kmer":      kmer,
+            "gc":        gc,
+            "positions": positions,
+            "pos_first": positions[names[0]]
+        })
+
+    results.sort(key=lambda x: x["pos_first"])
+
+    # Deduplicate: keep non-overlapping (gap >= 0)
+    deduped, last_pos = [], -9999
+    for r in results:
+        if r["pos_first"] - last_pos >= k:
+            deduped.append(r)
+            last_pos = r["pos_first"]
+
+    return deduped
+
+def common_regions_to_probe_df(common_regions, arm_type, seq_names):
+    """Convert common region list to probe DataFrame, applying QC filters."""
+    rows, failed = [], []
+    for idx, region in enumerate(common_regions):
+        kmer  = region["kmer"]
+        label = f"Common_region_{idx+1:02d}"
+        # Position note: pos in each sequence
+        pos_str = " | ".join(f"{n}:{p}" for n, p in region["positions"].items())
+        row = build_probe_row(idx + 1, kmer, arm_type, start=0, label=label)
+        if row:
+            row["GC_all_seqs"]    = region["gc"]
+            row["Positions"]      = pos_str
+            row["Same_position"]  = "Yes" if len(set(region["positions"].values())) == 1 else "No"
             rows.append(row)
         else:
             failed.append(label)
@@ -250,19 +319,19 @@ def write_info_sheet(ws, gene_name, arm_type, input_mode, extra_info, df):
     ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 28
     rows_info = [
-        ("Input mode",    input_mode),
-        ("Gene / Label",  gene_name),
+        ("Input mode",      input_mode),
+        ("Gene / Label",    gene_name),
         *extra_info,
-        ("Initiator set", arm_type),
-        ("P1 initiator",  ini["P1"]),
-        ("P2 initiator",  ini["P2"]),
-        ("Spacer S1",     ini["S1"]),
-        ("Spacer S2",     ini["S2"]),
-        ("Probes output", len(df)),
+        ("Initiator set",   arm_type),
+        ("P1 initiator",    ini["P1"]),
+        ("P2 initiator",    ini["P2"]),
+        ("Spacer S1",       ini["S1"]),
+        ("Spacer S2",       ini["S2"]),
+        ("Probes output",   len(df)),
         ("Oligos to order", len(df) * 2),
-        ("GC filter",     "35% – 65%"),
-        ("Hairpin filter","≤ 6 nt"),
-        ("Dimer filter",  "≤ 6 nt"),
+        ("GC filter",       "35% – 65%"),
+        ("Hairpin filter",  "≤ 6 nt"),
+        ("Dimer filter",    "≤ 6 nt"),
         ("Structure filter","≤ 4 matches"),
     ]
     for i, (k, v) in enumerate(rows_info, start=2):
@@ -273,9 +342,52 @@ def write_info_sheet(ws, gene_name, arm_type, input_mode, extra_info, df):
     ws.column_dimensions["A"].width = 28
     ws.column_dimensions["B"].width = 30
 
-def write_design_sheet(ws, df, gene_name, arm_type, has_label_col=False):
+def write_common_regions_sheet(ws, common_regions, seq_names):
+    """Extra sheet for Mode 3 only — shows all common regions before QC filter."""
+    ws.merge_cells("A1:I1")
+    ws["A1"] = f"All Common 52 bp Regions — {len(seq_names)} sequences"
+    ws["A1"].font = Font(name="Arial", size=13, bold=True, color=C_WHITE)
+    ws["A1"].fill = _fill(C_PURPLE)
+    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 28
+
+    HEADS  = ["#", "GC %", "GC Status", "Same Position?",
+              *[f"Pos in {n}" for n in seq_names],
+              "Common 52 bp Sequence"]
+    # dynamic widths for position columns
+    WIDTHS = [4, 7, 12, 14] + [14]*len(seq_names) + [56]
+    for ci, (h, w) in enumerate(zip(HEADS, WIDTHS), start=1):
+        cell = ws.cell(row=3, column=ci, value=h)
+        cell.font = _hfont(); cell.fill = _fill(C_DARK)
+        cell.alignment = _center(); cell.border = _thin_border()
+        ws.column_dimensions[get_column_letter(ci)].width = w
+    ws.row_dimensions[3].height = 20
+
+    for i, region in enumerate(common_regions, start=1):
+        gc    = region["gc"]
+        ok    = 35 <= gc <= 65
+        bg    = C_GREEN_LT if ok else C_RED_LT
+        same  = "Yes" if len(set(region["positions"].values())) == 1 else "No"
+        row_vals = (
+            [i, gc, "✔ PASS" if ok else "✘ High/Low GC", same]
+            + [region["positions"][n] for n in seq_names]
+            + [region["kmer"]]
+        )
+        for ci, v in enumerate(row_vals, start=1):
+            cell = ws.cell(row=3+i, column=ci, value=v)
+            cell.font = Font(name="Arial", size=10,
+                             bold=(ci==3),
+                             color=C_GREEN if (ok and ci==3) else C_RED if (not ok and ci==3) else C_DARK)
+            cell.fill = _fill(bg)
+            cell.border = _thin_border()
+            cell.alignment = _left() if ci == len(row_vals) else _center()
+    ws.freeze_panes = ws["A4"]
+
+def write_design_sheet(ws, df, gene_name, arm_type, has_label_col=False, extra_cols=None):
     ini = INITIATORS[arm_type]
-    last_col = "S" if has_label_col else "R"
+    n_extra = len(extra_cols) if extra_cols else 0
+    total_cols = 18 + (1 if has_label_col else 0) + n_extra
+    last_col = get_column_letter(total_cols)
     ws.merge_cells(f"A1:{last_col}1")
     ws["A1"] = f"HCR Probe Design Report  ·  {gene_name}  ·  Initiator: {arm_type}"
     ws["A1"].font = Font(name="Arial", size=13, bold=True, color=C_WHITE)
@@ -309,6 +421,12 @@ def write_design_sheet(ws, df, gene_name, arm_type, has_label_col=False):
         COL_WIDTHS = [22] + COL_WIDTHS
         KEYS       = ["Target_label"] + KEYS
 
+    if extra_cols:
+        for col_key, col_head, col_w in extra_cols:
+            HEADERS.append(col_head)
+            COL_WIDTHS.append(col_w)
+            KEYS.append(col_key)
+
     for ci, (h, w) in enumerate(zip(HEADERS, COL_WIDTHS), start=1):
         cell = ws.cell(row=5, column=ci, value=h)
         cell.font = _hfont(); cell.fill = _fill(C_DARK)
@@ -321,7 +439,7 @@ def write_design_sheet(ws, df, gene_name, arm_type, has_label_col=False):
         row = 6 + r_off
         for ci, key in enumerate(KEYS, start=1):
             cell = ws.cell(row=row, column=ci)
-            val  = rec[key]
+            val  = rec.get(key, "")
             if key == "Probe1_5to3":
                 cell.value = _rich_probe(val, ini["P1"], ini["S1"], spacer_after=False)
             elif key == "Probe2_5to3":
@@ -345,9 +463,8 @@ def write_order_sheet(ws, df, gene_name):
     ws["A2"].font = Font(name="Arial", size=10, italic=True, color=C_DARK)
     ws["A2"].fill = _fill(C_TEAL_LITE)
     ws["A2"].alignment = _left()
-
     HEADS  = ["Oligo Name","Sequence (5'→3')","Length (nt)","GC %","Tm (°C)","Purification","Notes"]
-    WIDTHS = [32,52,12,8,10,14,35]
+    WIDTHS = [32,52,12,8,10,14,40]
     for ci, (h, w) in enumerate(zip(HEADS, WIDTHS), start=1):
         cell = ws.cell(row=3, column=ci, value=h)
         cell.font = _hfont(); cell.fill = _fill(C_DARK)
@@ -367,6 +484,8 @@ def write_order_sheet(ws, df, gene_name):
             gc   = round(gc_content(seq), 1)
             tm   = round(tm_basic(seq), 1)
             note = f"Target: {rec['Target_sequence'][:20]}… | Arm{probe_num}"
+            if rec.get("Positions"):
+                note += f" | {rec['Positions']}"
             rich_seq = _rich_probe(seq,
                                    ini["P1"] if lbl=="P1" else ini["P2"],
                                    ini["S1"] if lbl=="P1" else ini["S2"],
@@ -385,14 +504,20 @@ def write_order_sheet(ws, df, gene_name):
         r += 1
     ws.freeze_panes = ws["A4"]
 
-def build_excel(df, gene_name, arm_type, input_mode, extra_info, has_label_col=False):
+def build_excel(df, gene_name, arm_type, input_mode, extra_info,
+                has_label_col=False, extra_cols=None,
+                common_regions=None, seq_names=None):
     wb = Workbook()
     ws_info   = wb.active; ws_info.title = "Run_Info"
+    if common_regions is not None:
+        ws_common = wb.create_sheet("All_Common_Regions")
     ws_design = wb.create_sheet("Probe_Design")
     ws_order  = wb.create_sheet("Order_Sheet")
-    write_info_sheet(ws_info,   gene_name, arm_type, input_mode, extra_info, df)
-    write_design_sheet(ws_design, df, gene_name, arm_type, has_label_col)
-    write_order_sheet(ws_order,  df, gene_name)
+    write_info_sheet(ws_info, gene_name, arm_type, input_mode, extra_info, df)
+    if common_regions is not None:
+        write_common_regions_sheet(ws_common, common_regions, seq_names)
+    write_design_sheet(ws_design, df, gene_name, arm_type, has_label_col, extra_cols)
+    write_order_sheet(ws_order, df, gene_name)
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
@@ -415,19 +540,19 @@ with st.sidebar:
     st.caption("Hairpin: ≤ 6 nt")
     st.caption("Dimer: ≤ 6 nt")
     st.caption("Structure: ≤ 4 matches")
-    st.caption("Max output (FASTA mode): 30 best probes")
+    st.caption("Max output (Mode 1): 30 best probes")
 
-# ── Two input mode tabs ────────────────────────────────────────────────────────
-tab_fasta, tab_targets = st.tabs([
-    "📄  Mode 1 — Full FASTA Sequence",
-    "🎯  Mode 2 — Direct 52 bp Target Regions"
+tab1, tab2, tab3 = st.tabs([
+    "📄  Mode 1 — Single FASTA",
+    "🎯  Mode 2 — Direct 52 bp Targets",
+    "🔀  Mode 3 — Multi-FASTA Common Regions",
 ])
 
 # ════════════════════════════════════════════════════════════
-#  TAB 1 — FASTA
+#  TAB 1 — SINGLE FASTA
 # ════════════════════════════════════════════════════════════
-with tab_fasta:
-    st.markdown("Paste a full gene sequence. The app tiles it into non-overlapping 52 bp windows, applies QC filters, and returns the top 30 probes.")
+with tab1:
+    st.markdown("Paste a single gene sequence. The app tiles it into non-overlapping 52 bp windows, applies QC filters, and returns the top 30 probes.")
 
     fasta_input = st.text_area(
         "Paste FASTA sequence",
@@ -435,7 +560,6 @@ with tab_fasta:
         placeholder=">gene_name\nATGGATGATGATATCGCCGCGCTCGTCGTCGAC...",
         key="fasta_input"
     )
-
     run_fasta = st.button("🚀 Design Probes from FASTA", type="primary",
                           use_container_width=True, key="run_fasta")
 
@@ -449,36 +573,29 @@ with tab_fasta:
             else:
                 gene_name, seq = next(iter(records.items()))
                 seq = seq.upper().replace("U", "T")
-
                 with st.spinner("Tiling and designing probes…"):
                     df = generate_probes_from_fasta(seq, arm_type, step=52)
-
                 if df.empty:
                     st.warning("No probes passed QC filters. Try a different initiator set.")
                 else:
                     df = rank_and_select(df, max_probes=30)
                     st.success(f"✅ {len(df)} probes designed — {len(df)*2} oligos ready to order")
-
                     c1, c2, c3, c4 = st.columns(4)
                     c1.metric("Gene",          gene_name)
                     c2.metric("Sequence (nt)", len(seq))
                     c3.metric("Probes",        len(df))
                     c4.metric("Oligos",        len(df)*2)
-
                     st.subheader("Probe Preview")
-                    preview = ["Probe_#","Target_start","Target_end","GC_percent",
-                               "Tm_P1_C","Tm_P2_C","Hairpin_P1","Hairpin_P2",
-                               "Dimer_score","Structure_score"]
-                    st.dataframe(df[preview], use_container_width=True, hide_index=True)
-
+                    st.dataframe(df[["Probe_#","Target_start","Target_end","GC_percent",
+                                     "Tm_P1_C","Tm_P2_C","Hairpin_P1","Hairpin_P2",
+                                     "Dimer_score","Structure_score"]],
+                                 use_container_width=True, hide_index=True)
                     extra = [("Sequence length (nt)", len(seq)),
-                             ("Tiling step (nt)",     52),
-                             ("Max probes cap",        30)]
+                             ("Tiling step (nt)", 52), ("Max probes cap", 30)]
                     excel_bytes = build_excel(df, gene_name, arm_type,
-                                             "FASTA — auto tiling", extra,
-                                             has_label_col=False)
+                                             "Single FASTA — auto tiling", extra)
                     st.download_button(
-                        label="📥 Download Excel (Probe_Design + Order_Sheet)",
+                        "📥 Download Excel",
                         data=excel_bytes,
                         file_name=f"HCR_probes_{gene_name}_{arm_type}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -488,47 +605,17 @@ with tab_fasta:
 # ════════════════════════════════════════════════════════════
 #  TAB 2 — DIRECT 52 BP TARGETS
 # ════════════════════════════════════════════════════════════
-with tab_targets:
-    st.markdown(
-        "Paste **pre-selected 52 bp target regions** — one per line. "
-        "Add a `>label` before each sequence (FASTA-style) or just paste bare sequences. "
-        "Each sequence must be exactly 52 bp (longer sequences are trimmed to first 52 bp)."
-    )
-
+with tab2:
+    st.markdown("Paste pre-selected 52 bp target regions. Add `>label` before each (FASTA-style) or just paste bare sequences.")
     st.info(
-        "**Accepted formats — with labels (recommended):**\n"
-        "```\n"
-        ">Common_region_06\n"
-        "CGTCTTCCTCATGTACCTCTCCCAAACCCGGACCAAGTTGGCCGACGGACTG\n\n"
-        ">Common_region_07\n"
-        "GACTCCGAACAGATTTCGGGCAAGAAGATCCGTGACACCCTCTACAGCCTCA\n"
-        "```\n"
-        "**Or plain (auto-numbered):**\n"
-        "```\n"
-        "CGTCTTCCTCATGTACCTCTCCCAAACCCGGACCAAGTTGGCCGACGGACTG\n"
-        "GACTCCGAACAGATTTCGGGCAAGAAGATCCGTGACACCCTCTACAGCCTCA\n"
-        "```",
+        "**With labels:**\n```\n>Region_06\nCGTCTTCCTCATGTACCTCTCCCAAACCCGGACCAAGTTGGCCGACGGACTG\n```\n"
+        "**Plain:**\n```\nCGTCTTCCTCATGTACCTCTCCCAAACCCGGACCAAGTTGGCCGACGGACTG\n```",
         icon="💡"
     )
-
-    gene_label = st.text_input(
-        "Gene / experiment label (used in oligo names and file name)",
-        value="MyGene",
-        key="gene_label"
-    )
-
-    target_input = st.text_area(
-        "Paste 52 bp target regions here",
-        height=260,
-        placeholder=(
-            ">Common_region_06\n"
-            "CGTCTTCCTCATGTACCTCTCCCAAACCCGGACCAAGTTGGCCGACGGACTG\n\n"
-            ">Common_region_07\n"
-            "GACTCCGAACAGATTTCGGGCAAGAAGATCCGTGACACCCTCTACAGCCTCA"
-        ),
-        key="target_input"
-    )
-
+    gene_label = st.text_input("Gene / experiment label", value="MyGene", key="gene_label")
+    target_input = st.text_area("Paste 52 bp target regions", height=250,
+                                placeholder=">Region_06\nCGTCTTCCTCATGTACCTCTCCCAAACCCGGACCAAGTTGGCCGACGGACTG",
+                                key="target_input")
     run_targets = st.button("🚀 Design Probes from Target Regions", type="primary",
                             use_container_width=True, key="run_targets")
 
@@ -537,46 +624,162 @@ with tab_targets:
             st.error("Please paste at least one 52 bp target sequence above.")
         else:
             targets = parse_target_input(target_input)
-
             if not targets:
                 st.error("No valid sequences found. Each sequence must be ≥ 52 nt.")
             else:
                 with st.spinner(f"Designing probes for {len(targets)} target region(s)…"):
                     df, failed = generate_probes_from_targets(targets, arm_type)
-
                 if failed:
-                    st.warning(
-                        f"⚠️ {len(failed)} target(s) failed QC filters and were excluded: "
-                        + ", ".join(failed)
-                    )
-
+                    st.warning(f"⚠️ {len(failed)} target(s) failed QC: " + ", ".join(failed))
                 if df.empty:
                     st.error("All targets failed QC filters. Try a different initiator set.")
                 else:
                     st.success(f"✅ {len(df)} probes designed — {len(df)*2} oligos ready to order")
-
                     c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Label",            gene_label)
-                    c2.metric("Targets supplied",  len(targets))
-                    c3.metric("Probes passed QC",  len(df))
-                    c4.metric("Oligos",            len(df)*2)
-
+                    c1.metric("Label",           gene_label)
+                    c2.metric("Targets supplied", len(targets))
+                    c3.metric("Probes passed QC", len(df))
+                    c4.metric("Oligos",           len(df)*2)
                     st.subheader("Probe Preview")
-                    preview = ["Probe_#","Target_label","Target_sequence","GC_percent",
-                               "Tm_P1_C","Tm_P2_C","Hairpin_P1","Hairpin_P2",
-                               "Dimer_score","Structure_score"]
-                    st.dataframe(df[preview], use_container_width=True, hide_index=True)
-
-                    extra = [("Targets supplied",  len(targets)),
+                    st.dataframe(df[["Probe_#","Target_label","Target_sequence","GC_percent",
+                                     "Tm_P1_C","Tm_P2_C","Hairpin_P1","Hairpin_P2",
+                                     "Dimer_score","Structure_score"]],
+                                 use_container_width=True, hide_index=True)
+                    extra = [("Targets supplied", len(targets)),
                              ("Targets passed QC", len(df)),
                              ("Targets failed QC", len(failed))]
                     excel_bytes = build_excel(df, gene_label, arm_type,
                                              "Direct 52 bp target regions", extra,
                                              has_label_col=True)
                     st.download_button(
-                        label="📥 Download Excel (Probe_Design + Order_Sheet)",
+                        "📥 Download Excel",
                         data=excel_bytes,
                         file_name=f"HCR_probes_{gene_label}_{arm_type}_targets.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True,
                     )
+
+# ════════════════════════════════════════════════════════════
+#  TAB 3 — MULTI-FASTA COMMON REGIONS
+# ════════════════════════════════════════════════════════════
+with tab3:
+    st.markdown(
+        "Paste a **multi-FASTA file** containing 2 or more sequences. "
+        "The app will first find all **non-overlapping 52 bp regions common to every sequence**, "
+        "apply QC filters, then design HCR probes on the passing regions."
+    )
+    st.info(
+        "Paste all sequences together — each starting with `>`:\n"
+        "```\n>CD8A_isoform1\nATGGCCTCCTGGGTGACC...\n\n>CD8A_isoform2\nATGGCCTCCTGGGTGACC...\n```",
+        icon="💡"
+    )
+
+    multi_label = st.text_input(
+        "Gene / experiment label (used in oligo names)",
+        value="MultiSeq", key="multi_label"
+    )
+
+    multi_fasta_input = st.text_area(
+        "Paste multi-FASTA here (2+ sequences)",
+        height=260,
+        placeholder=">Isoform_1\nATGGCCTCCTGGGTGACC...\n\n>Isoform_2\nATGGCCTCCTGGGTGACC...",
+        key="multi_fasta_input"
+    )
+
+    run_multi = st.button("🔍 Find Common Regions & Design Probes", type="primary",
+                          use_container_width=True, key="run_multi")
+
+    if run_multi:
+        if not multi_fasta_input.strip():
+            st.error("Please paste a multi-FASTA above.")
+        else:
+            records = parse_fasta(multi_fasta_input)
+            if len(records) < 2:
+                st.error("Need at least 2 sequences. Make sure each starts with a > header line.")
+            else:
+                seq_names = list(records.keys())
+                st.info(f"Found **{len(records)} sequences**: {', '.join(f'`{n}`' for n in seq_names)}")
+
+                # ── Step 1: find common regions ────────────────────────────────
+                with st.spinner("Finding common 52 bp regions across all sequences…"):
+                    common_regions = find_common_regions(records, k=52)
+
+                if not common_regions:
+                    st.error("No 52 bp regions found in common across all sequences.")
+                else:
+                    # Show common region summary table
+                    st.subheader(f"Step 1 — Common Regions Found: {len(common_regions)}")
+                    summary_rows = []
+                    for i, r in enumerate(common_regions, 1):
+                        row = {"#": i, "GC %": r["gc"],
+                               "GC Status": "✔ PASS" if 35 <= r["gc"] <= 65 else "✘ Fail",
+                               "Same Position?": "Yes" if len(set(r["positions"].values())) == 1 else "No",
+                               "Sequence (52 bp)": r["kmer"]}
+                        for n in seq_names:
+                            row[f"Pos in {n}"] = r["positions"][n]
+                        summary_rows.append(row)
+                    summary_df = pd.DataFrame(summary_rows)
+                    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+                    gc_pass = sum(1 for r in common_regions if 35 <= r["gc"] <= 65)
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Total common regions", len(common_regions))
+                    c2.metric("GC 35–65% (usable)",   gc_pass)
+                    c3.metric("High/low GC (flagged)", len(common_regions) - gc_pass)
+
+                    st.divider()
+
+                    # ── Step 2: design probes on passing common regions ────────
+                    with st.spinner("Designing HCR probes on passing common regions…"):
+                        df, failed = common_regions_to_probe_df(
+                            common_regions, arm_type, seq_names
+                        )
+
+                    if failed:
+                        st.warning(f"⚠️ {len(failed)} region(s) failed QC filters: " + ", ".join(failed))
+
+                    if df.empty:
+                        st.error("No probes passed QC. Try a different initiator set.")
+                    else:
+                        st.subheader(f"Step 2 — Probes Designed: {len(df)}")
+                        st.success(f"✅ {len(df)} probes — {len(df)*2} oligos ready to order")
+
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("Sequences",         len(records))
+                        c2.metric("Common regions",    len(common_regions))
+                        c3.metric("Probes passed QC",  len(df))
+                        c4.metric("Oligos",            len(df)*2)
+
+                        preview_cols = ["Probe_#","Target_label","Target_sequence",
+                                        "GC_percent","Tm_P1_C","Tm_P2_C",
+                                        "Hairpin_P1","Hairpin_P2","Dimer_score",
+                                        "Structure_score","Same_position","Positions"]
+                        st.dataframe(df[[c for c in preview_cols if c in df.columns]],
+                                     use_container_width=True, hide_index=True)
+
+                        extra = [
+                            ("Sequences in file",   len(records)),
+                            ("Sequence names",       ", ".join(seq_names)),
+                            ("Common regions found", len(common_regions)),
+                            ("Regions passed QC",    len(df)),
+                            ("Regions failed QC",    len(failed)),
+                        ]
+                        extra_cols = [
+                            ("Same_position", "Same Position?", 16),
+                            ("Positions",     "Positions in each sequence", 45),
+                        ]
+                        excel_bytes = build_excel(
+                            df, multi_label, arm_type,
+                            "Multi-FASTA — common 52 bp regions", extra,
+                            has_label_col=True,
+                            extra_cols=extra_cols,
+                            common_regions=common_regions,
+                            seq_names=seq_names,
+                        )
+                        st.download_button(
+                            "📥 Download Excel (All_Common_Regions + Probe_Design + Order_Sheet)",
+                            data=excel_bytes,
+                            file_name=f"HCR_probes_{multi_label}_{arm_type}_common.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                        )
